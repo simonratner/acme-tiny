@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, logging
+import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, time, platform, logging
 try:
     from urllib.request import urlopen # Python 3
 except ImportError:
@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
-def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
+def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
     # helper function base64 encode for jose spec
     def _b64(b):
         return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
@@ -61,6 +61,15 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         except IOError as e:
             return getattr(e, "code", None), getattr(e, "read", e.__str__)()
 
+    # helper function for heroku commands
+    def _heroku(cmd):
+        if platform.system() == "Windows":
+            cmd[:0] = ["cmd", "/c", "heroku"]
+        else:
+            cmd[:0] = ["heroku"]
+        cmd.append("--app={0}".format(heroku_app))
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     # find domains
     log.info("Parsing CSR...")
     proc = subprocess.Popen(["openssl", "req", "-in", csr, "-noout", "-text"],
@@ -107,22 +116,28 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         challenge = [c for c in json.loads(result.decode('utf8'))['challenges'] if c['type'] == "http-01"][0]
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
-        wellknown_path = os.path.join(acme_dir, token)
-        with open(wellknown_path, "w") as wellknown_file:
-            wellknown_file.write(keyauthorization)
 
-        # check that the file is in place
+        proc = _heroku([
+            "config:set",
+            "{0}={1}".format("ACME_CHALLENGE", token),
+            "{0}={1}".format("ACME_RESPONSE", keyauthorization)])
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise IOError("Error setting heroku config: {0}".format(err))
+
+        time.sleep(2)
+
+        # check that the challenge response is in place
         wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
         try:
             resp = urlopen(wellknown_url)
             resp_data = resp.read().decode('utf8').strip()
             assert resp_data == keyauthorization
         except (IOError, AssertionError):
-            os.remove(wellknown_path)
-            raise ValueError("Wrote file to {0}, but couldn't download {1}".format(
-                wellknown_path, wellknown_url))
+            raise ValueError("Set heroku config, but couldn't download {0}".format(
+                wellknown_url))
 
-        # notify challenge are met
+        # notify challenge is met
         code, result = _send_signed_request(challenge['uri'], {
             "resource": "challenge",
             "keyAuthorization": keyauthorization,
@@ -142,7 +157,6 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
                 time.sleep(2)
             elif challenge_status['status'] == "valid":
                 log.info("{0} verified!".format(domain))
-                os.remove(wellknown_path)
                 break
             else:
                 raise ValueError("{0} challenge did not pass: {1}".format(
@@ -175,23 +189,21 @@ def main(argv):
             only ~200 lines, so it won't take long.
 
             ===Example Usage===
-            python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed.crt
+            # Executes heroku config:set ACME_CHALLENGE=... ACME_RESPONSE=...
+            python acme_tiny.py --account-key ./account.key --csr ./domain.csr --heroku my-app > domain.crt
+            heroku certs:update domain.crt domain.key
             ===================
-
-            ===Example Crontab Renewal (once per month)===
-            0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed.crt 2>> /var/log/acme_tiny.log
-            ==============================================
             """)
     )
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
     parser.add_argument("--csr", required=True, help="path to your certificate signing request")
-    parser.add_argument("--acme-dir", required=True, help="path to the .well-known/acme-challenge/ directory")
+    parser.add_argument("--heroku", required=True, help="name of heroku app to configure")
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
     parser.add_argument("--ca", default=DEFAULT_CA, help="certificate authority, default is Let's Encrypt")
 
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
-    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca)
+    signed_crt = get_crt(args.account_key, args.csr, args.heroku, log=LOGGER, CA=args.ca)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
