@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
-def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
+def get_crt(account_key, csr, apps, log=LOGGER, CA=DEFAULT_CA):
     # helper function base64 encode for jose spec
     def _b64(b):
         return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
@@ -62,12 +62,12 @@ def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
             return getattr(e, "code", None), getattr(e, "read", e.__str__)()
 
     # helper function for heroku commands
-    def _heroku(cmd):
+    def _heroku(app, cmd):
         if platform.system() == "Windows":
             cmd[:0] = ["cmd", "/c", "heroku"]
         else:
             cmd[:0] = ["heroku"]
-        cmd.append("--app={0}".format(heroku_app))
+        cmd.append("--app={0}".format(app))
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     # find domains
@@ -77,15 +77,15 @@ def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
     out, err = proc.communicate()
     if proc.returncode != 0:
         raise IOError("Error loading {0}: {1}".format(csr, err))
-    domains = set([])
+    domains = []
     common_name = re.search(r"Subject:.*? CN=([^\s,;/]+)", out.decode('utf8'))
     if common_name is not None:
-        domains.add(common_name.group(1))
+        domains.append(common_name.group(1))
     subject_alt_names = re.search(r"X509v3 Subject Alternative Name: \n +([^\n]+)\n", out.decode('utf8'), re.MULTILINE|re.DOTALL)
     if subject_alt_names is not None:
         for san in subject_alt_names.group(1).split(", "):
             if san.startswith("DNS:"):
-                domains.add(san[4:])
+                domains.append(san[4:])
 
     # get the certificate domains and expiration
     log.info("Registering account...")
@@ -101,7 +101,7 @@ def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
         raise ValueError("Error registering: {0} {1}".format(code, result))
 
     # verify each domain
-    for domain in domains:
+    for (domain, app) in zip(domains, apps):
         log.info("Verifying {0}...".format(domain))
 
         # get new challenge
@@ -117,7 +117,7 @@ def get_crt(account_key, csr, heroku_app, log=LOGGER, CA=DEFAULT_CA):
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
 
-        proc = _heroku([
+        proc = _heroku(app, [
             "config:set",
             "{0}={1}".format("ACME_CHALLENGE", token),
             "{0}={1}".format("ACME_RESPONSE", keyauthorization)])
@@ -197,13 +197,13 @@ def main(argv):
     )
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
     parser.add_argument("--csr", required=True, help="path to your certificate signing request")
-    parser.add_argument("--heroku", required=True, help="name of heroku app to configure")
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
     parser.add_argument("--ca", default=DEFAULT_CA, help="certificate authority, default is Let's Encrypt")
+    parser.add_argument("apps", metavar="APP", nargs="+", help="name of heroku app(s) to configure")
 
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
-    signed_crt = get_crt(args.account_key, args.csr, args.heroku, log=LOGGER, CA=args.ca)
+    signed_crt = get_crt(args.account_key, args.csr, args.apps, log=LOGGER, CA=args.ca)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
